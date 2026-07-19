@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
-models/
+models/*
+!models/.gitkeep
+!models/buffalo_l/
+models/buffalo_l/*
+!models/buffalo_l/.gitkeep
