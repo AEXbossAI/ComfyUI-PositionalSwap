@@ -11,8 +11,11 @@ insightface ВЕНДОРЕН в vendor/ (pip-пакет тянет CPU-onnxrunti
 Модели: models/buffalo_l/{det_10g,genderage,w600k_r50}.onnx + models/codeformer.onnx (манифест),
 inswapper_128.onnx берётся из Facefusion_comfyui/models (уже в контейнере) или models/.
 
-Вход plan (JSON, порядок = порядок регионов = порядок ref_1..ref_3):
-  [{"sex": "M"|"F", "is_bj": false}, ...]
+Вход plan (JSON, порядок = порядок регионов):
+  [{"sex": "M"|"F", "is_bj": false, "ref": 1|2|3|null, "skip": false}, ...]
+"ref" — номер входа ref_N с рефом этого слота. "skip": true (или ref=null) — персонаж БЕЗ рефа:
+он УЧАСТВУЕТ в позиционной раскладке (его лицо занимает свою позицию и защищается от fallback),
+но не свапается — иначе частичный свап сажал бы реф на чужое лицо.
 """
 import os
 import sys
@@ -170,8 +173,8 @@ def _prepare_source_face(app, ref_bgr, idx):
     return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
 
-def _swap_all(scene_bgr, plan, refs_bgr, restore_blend):
-    """plan = [{"sex","is_bj"}...] в порядке регионов; refs_bgr — рефы в том же порядке."""
+def _swap_all(scene_bgr, plan, refs_bgr_by_slot, restore_blend):
+    """plan = [{"sex","is_bj","skip"}...] в порядке регионов; refs_bgr_by_slot[i] — реф слота i (или None)."""
     app, swapper = _get_app(), _get_swapper()
 
     faces = app.get(scene_bgr)
@@ -205,10 +208,15 @@ def _swap_all(scene_bgr, plan, refs_bgr, restore_blend):
 
     def do(char_idx, slot, tgt, label):
         nonlocal result, n
+        if slot.get("skip") or refs_bgr_by_slot[char_idx] is None:
+            # без рефа: позицию занимает, лицо защищено от fallback, но не свапаем
+            print(f"[PositionalSwap] {label} x0={tgt.bbox[0]:.0f} slot{char_idx + 1} SKIP (no ref)")
+            used.add(id(tgt))
+            return
         if char_idx not in sources:
-            sources[char_idx] = _prepare_source_face(app, refs_bgr[char_idx], char_idx)
+            sources[char_idx] = _prepare_source_face(app, refs_bgr_by_slot[char_idx], char_idx)
         src = sources[char_idx]
-        print(f"[PositionalSwap] {label} x0={tgt.bbox[0]:.0f} <- ref_{char_idx + 1}"
+        print(f"[PositionalSwap] {label} x0={tgt.bbox[0]:.0f} <- slot{char_idx + 1}"
               f"{' +BJ' if slot.get('is_bj') else ''}")
         sw = swapper.get(result, tgt, src, paste_back=True)
         if slot.get("is_bj"):
@@ -276,12 +284,19 @@ class PositionalRegionSwap:
 
     def execute(self, image, plan, restore_blend, ref_1=None, ref_2=None, ref_3=None):
         slots = json.loads(plan)
-        refs = [r for r in (ref_1, ref_2, ref_3) if r is not None]
-        if len(refs) < len(slots):
-            raise ValueError(f"[PositionalSwap] plan has {len(slots)} slots but only {len(refs)} refs")
+        ref_inputs = {1: ref_1, 2: ref_2, 3: ref_3}
+        refs_bgr_by_slot = []
+        for i, slot in enumerate(slots):
+            if slot.get("skip"):
+                refs_bgr_by_slot.append(None)
+                continue
+            rn = slot.get("ref", i + 1)     # дефолт: слот i ↔ ref_{i+1}
+            img_ref = ref_inputs.get(rn)
+            if img_ref is None:
+                raise ValueError(f"[PositionalSwap] slot {i + 1} expects ref_{rn} but it is not connected")
+            refs_bgr_by_slot.append(_img_to_bgr(img_ref))
         scene_bgr = _img_to_bgr(image)
-        refs_bgr = [_img_to_bgr(r) for r in refs[:len(slots)]]
-        out = _swap_all(scene_bgr, slots, refs_bgr, restore_blend)
+        out = _swap_all(scene_bgr, slots, refs_bgr_by_slot, restore_blend)
         return (_bgr_to_img(out),)
 
 
