@@ -12,8 +12,13 @@ insightface ВЕНДОРЕН в vendor/ (pip-пакет тянет CPU-onnxrunti
 inswapper_128.onnx берётся из Facefusion_comfyui/models (уже в контейнере) или models/.
 
 Вход plan (JSON, порядок = порядок регионов):
-  [{"sex": "M"|"F", "is_bj": false, "ref": 1|2|3|null, "skip": false}, ...]
-"ref" — номер входа ref_N с рефом этого слота. "skip": true (или ref=null) — персонаж БЕЗ рефа:
+  [{"sex": "M"|"F", "is_bj": false, "refs": [1, 2], "skip": false}, ...]
+"refs" — список номеров входов ref_N с реф-фото этого слота. Несколько рефов -> multi-ref:
+для каждого рефа берётся крупнейшее лицо, их normed_embedding'и усредняются (np.mean по оси 0
++ L2-ренормировка) и подставляются в blended Face (паттерн ReActor blend_faces) — устойчивость
+к улыбке/прищуру на отдельных фото. Один реф — поведение идентично старому.
+Легаси-формат поддержан: "ref": N (один реф) и дефолт (слот i ↔ ref_{i+1}) работают как раньше.
+"skip": true (или refs/ref = null) — персонаж БЕЗ рефа:
 он УЧАСТВУЕТ в позиционной раскладке (его лицо занимает свою позицию и защищается от fallback),
 но не свапается — иначе частичный свап сажал бы реф на чужое лицо.
 """
@@ -166,15 +171,44 @@ def _preserve_mouth(orig_bgr, swapped_bgr, face):
 
 
 # ── ядро: порт _swap_all (test_pose_matrix_v4) ───────────────────────────────
-def _prepare_source_face(app, ref_bgr, idx):
+def _largest_face(app, ref_bgr):
     faces = app.get(ref_bgr)
     if not faces:
-        raise RuntimeError(f"[PositionalSwap] no face in ref_{idx + 1}")
+        return None
     return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
 
+def _prepare_slot_source(app, slot_refs, slot_idx):
+    """slot_refs = [(ref_num, bgr), ...] — рефы одного слота.
+    1 реф -> крупнейшее лицо (как раньше). Несколько -> усреднение normed_embedding
+    (mean по оси 0 + L2-ренорм) в копии первого Face: подменяем поле 'embedding'
+    (swapper берёт source.normed_embedding = embedding/norm, нормировка применится сама)."""
+    found = []
+    for ref_num, ref_bgr in slot_refs:
+        face = _largest_face(app, ref_bgr)
+        if face is None:
+            print(f"[PositionalSwap] WARN: no face in ref_{ref_num} (slot {slot_idx + 1}) — ref skipped")
+            continue
+        found.append((ref_num, face))
+    if not found:
+        nums = ", ".join(f"ref_{n}" for n, _ in slot_refs)
+        raise RuntimeError(f"[PositionalSwap] no face in any ref of slot {slot_idx + 1} ({nums})")
+    if len(found) == 1:
+        return found[0][1]
+    embs = np.stack([f.normed_embedding for _, f in found])
+    mean = embs.mean(axis=0)
+    mean = mean / np.linalg.norm(mean)
+    first = found[0][1]
+    blended = type(first)(first)            # insightface Face — dict-подкласс, shallow copy
+    blended["embedding"] = mean.astype(np.float32)
+    print(f"[PositionalSwap] slot {slot_idx + 1}: blended {len(found)} refs "
+          f"({', '.join(f'ref_{n}' for n, _ in found)}) -> mean embedding")
+    return blended
+
+
 def _swap_all(scene_bgr, plan, refs_bgr_by_slot, restore_blend):
-    """plan = [{"sex","is_bj","skip"}...] в порядке регионов; refs_bgr_by_slot[i] — реф слота i (или None)."""
+    """plan = [{"sex","is_bj","skip"}...] в порядке регионов;
+    refs_bgr_by_slot[i] — список [(ref_num, bgr), ...] рефов слота i (или None если без рефа)."""
     app, swapper = _get_app(), _get_swapper()
 
     faces = app.get(scene_bgr)
@@ -214,7 +248,7 @@ def _swap_all(scene_bgr, plan, refs_bgr_by_slot, restore_blend):
             used.add(id(tgt))
             return
         if char_idx not in sources:
-            sources[char_idx] = _prepare_source_face(app, refs_bgr_by_slot[char_idx], char_idx)
+            sources[char_idx] = _prepare_slot_source(app, refs_bgr_by_slot[char_idx], char_idx)
         src = sources[char_idx]
         print(f"[PositionalSwap] {label} x0={tgt.bbox[0]:.0f} <- slot{char_idx + 1}"
               f"{' +BJ' if slot.get('is_bj') else ''}")
@@ -274,6 +308,9 @@ class PositionalRegionSwap:
                 "ref_1": ("IMAGE",),
                 "ref_2": ("IMAGE",),
                 "ref_3": ("IMAGE",),
+                "ref_4": ("IMAGE",),
+                "ref_5": ("IMAGE",),
+                "ref_6": ("IMAGE",),
             },
         }
 
@@ -282,19 +319,29 @@ class PositionalRegionSwap:
     FUNCTION = "execute"
     CATEGORY = "PositionalSwap"
 
-    def execute(self, image, plan, restore_blend, ref_1=None, ref_2=None, ref_3=None):
+    def execute(self, image, plan, restore_blend,
+                ref_1=None, ref_2=None, ref_3=None, ref_4=None, ref_5=None, ref_6=None):
         slots = json.loads(plan)
-        ref_inputs = {1: ref_1, 2: ref_2, 3: ref_3}
+        ref_inputs = {1: ref_1, 2: ref_2, 3: ref_3, 4: ref_4, 5: ref_5, 6: ref_6}
         refs_bgr_by_slot = []
         for i, slot in enumerate(slots):
             if slot.get("skip"):
                 refs_bgr_by_slot.append(None)
                 continue
-            rn = slot.get("ref", i + 1)     # дефолт: слот i ↔ ref_{i+1}
-            img_ref = ref_inputs.get(rn)
-            if img_ref is None:
-                raise ValueError(f"[PositionalSwap] slot {i + 1} expects ref_{rn} but it is not connected")
-            refs_bgr_by_slot.append(_img_to_bgr(img_ref))
+            nums = slot.get("refs")
+            if nums is None:                # легаси: "ref": N; дефолт: слот i ↔ ref_{i+1}
+                rn = slot.get("ref", i + 1)
+                nums = [rn] if rn is not None else None
+            if not nums:                    # refs/ref = null или [] — персонаж без рефа
+                refs_bgr_by_slot.append(None)
+                continue
+            slot_refs = []
+            for rn in nums:
+                img_ref = ref_inputs.get(rn)
+                if img_ref is None:
+                    raise ValueError(f"[PositionalSwap] slot {i + 1} expects ref_{rn} but it is not connected")
+                slot_refs.append((rn, _img_to_bgr(img_ref)))
+            refs_bgr_by_slot.append(slot_refs)
         scene_bgr = _img_to_bgr(image)
         out = _swap_all(scene_bgr, slots, refs_bgr_by_slot, restore_blend)
         return (_bgr_to_img(out),)

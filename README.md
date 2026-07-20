@@ -14,4 +14,11 @@ Models (delivered by manifest):
 - inswapper_128.onnx is reused from Facefusion_comfyui/models (fallback: models/).
 
 Node: **PositionalRegionSwap** (image, plan JSON [{"sex","is_bj"}...] in region order,
-restore_blend, ref_1..ref_3) -> swapped image.
+restore_blend, ref_1..ref_6) -> swapped image.
+
+Multi-ref per slot: a plan slot may list several reference inputs, e.g. `{"sex":"F","refs":[1,2]}`.
+The largest face is taken from each ref, their normed embeddings are averaged (np.mean +
+L2 re-normalization) and injected into a blended Face (ReActor blend_faces pattern) — makes
+identity robust to smiles/squints on individual photos. Refs where no face is detected are
+skipped with a warning; if no ref of a slot has a face, the node raises. Legacy formats still
+work: `"ref": N` (single ref) and the default mapping slot i <-> ref_{i+1}.
