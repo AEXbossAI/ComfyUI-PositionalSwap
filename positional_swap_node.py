@@ -206,6 +206,36 @@ def _prepare_slot_source(app, slot_refs, slot_idx):
     return blended
 
 
+def _own_face_mask(scene_shape, tgt, all_faces, feather=5):
+    """Маска «только СВОЁ лицо» для близких лиц (фикс перекрытия кропов, §2.5, 14.09).
+
+    Возвращает float-маску [0..1] = convex hull 106-landmark целевого лица (+dilate 12%),
+    пересечённый с ячейкой Вороного (пиксели ближе к центру ЭТОГО лица, чем к любому
+    соседнему). Гарантирует, что paste одного свапа не залезет на соседнее лицо.
+    Замер эмбеддингов 11.09 доказал: без этого при поцелуях оба лица получали один реф."""
+    h, w = scene_shape[:2]
+    own = np.zeros((h, w), np.uint8)
+    lmk = getattr(tgt, "landmark_2d_106", None)
+    if lmk is not None:
+        cv2.fillConvexPoly(own, cv2.convexHull(lmk.astype(np.int32)), 1)
+        k = max(5, int((tgt.bbox[3] - tgt.bbox[1]) * 0.12)) | 1
+        own = cv2.dilate(own, np.ones((k, k), np.uint8))
+    else:
+        x1, y1, x2, y2 = [int(v) for v in tgt.bbox]
+        own[max(0, y1):y2, max(0, x1):x2] = 1
+    # ячейка Вороного по центрам bbox всех лиц
+    if len(all_faces) > 1:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cen = [((f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2) for f in all_faces]
+        dist = np.stack([(xx - cx) ** 2 + (yy - cy) ** 2 for cx, cy in cen])
+        ti = min(range(len(all_faces)),
+                 key=lambda j: (all_faces[j].bbox[0] - tgt.bbox[0]) ** 2
+                 + (all_faces[j].bbox[1] - tgt.bbox[1]) ** 2)
+        own = own & (dist.argmin(axis=0) == ti).astype(np.uint8)
+    m = cv2.GaussianBlur((own * 255).astype(np.uint8), (feather * 2 + 1,) * 2, 0)
+    return m.astype(np.float32) / 255.0
+
+
 def _swap_all(scene_bgr, plan, refs_bgr_by_slot, restore_blend):
     """plan = [{"sex","is_bj","skip"}...] в порядке регионов;
     refs_bgr_by_slot[i] — список [(ref_num, bgr), ...] рефов слота i (или None если без рефа)."""
@@ -252,21 +282,40 @@ def _swap_all(scene_bgr, plan, refs_bgr_by_slot, restore_blend):
         src = sources[char_idx]
         print(f"[PositionalSwap] {label} x0={tgt.bbox[0]:.0f} <- slot{char_idx + 1}"
               f"{' +BJ' if slot.get('is_bj') else ''}")
-        sw = swapper.get(result, tgt, src, paste_back=True)
+        # ФИКС ПЕРЕКРЫТИЯ (§2.5, 14.09): свапаем на КОПИИ result и вклеиваем только
+        # маску своего лица — иначе paste_back затирает уже свапнутого соседа целиком
+        # (при поцелуях оба лица получали один реф, доказано эмбеддингами 11.09).
+        base = result.copy()
+        sw = swapper.get(base, tgt, src, paste_back=True)
         if slot.get("is_bj"):
-            sw = _preserve_mouth(result, sw, tgt)
-        result = sw
+            sw = _preserve_mouth(base, sw, tgt)
+        m = _own_face_mask(result.shape, tgt, faces)[..., None]
+        result = (result * (1.0 - m) + sw * m).astype(np.uint8)
         n += 1
         used.add(id(tgt))
 
     leftover = []
-    for sx in ("M", "F"):
-        chs, fcs = chars_by_sex[sx], faces_by_sex.get(sx, [])
-        for i in range(len(chs)):
-            if i < len(fcs):
-                do(chs[i][0], chs[i][1], fcs[i], f"swap {sx}[{i}]")
-            else:
-                leftover.append(chs[i])
+    # 07.09.2026: ПОЗИЦИОННОЕ назначение приоритетнее гендерного. Гендер-классификатор
+    # insightface путает пол на профилях/минете (женское лицо в глубоком профиле -> "M"),
+    # из-за чего рефы девушки и парня менялись местами («лица перепутаны везде», близкие
+    # кадры CN-итераций). Слоты плана идут В ПОРЯДКЕ РЕГИОНОВ (L->R) — если лиц найдено
+    # ровно столько, сколько слотов, надёжнее сажать i-е лицо слева в i-й слот и пол
+    # не спрашивать вовсе. Гендерный матчинг остаётся фолбэком при нехватке/избытке лиц.
+    _same_sex_pair = max(len(chars_by_sex["M"]), len(chars_by_sex["F"])) >= 2
+    if len(faces) == len(plan) and _same_sex_pair:
+        # только для планов, где пол НЕ различает слоты (2+ одного пола); MF-пары остаются
+        # на гендерном матчинге — он устойчив к вертикальным позам (X-сортировка там врёт)
+        print(f"[PositionalSwap] positional mode: {len(plan)} faces == {len(plan)} slots")
+        for i, tgt in enumerate(sorted(faces, key=lambda f: f.bbox[0])):
+            do(i, plan[i], tgt, f"swap pos[{i}]")
+    else:
+        for sx in ("M", "F"):
+            chs, fcs = chars_by_sex[sx], faces_by_sex.get(sx, [])
+            for i in range(len(chs)):
+                if i < len(fcs):
+                    do(chs[i][0], chs[i][1], fcs[i], f"swap {sx}[{i}]")
+                else:
+                    leftover.append(chs[i])
     free = [f for f in sorted(faces, key=lambda f: f.bbox[0]) if id(f) not in used]
     if leftover and free:
         print(f"[PositionalSwap] fallback: {len(leftover)} chars <- {len(free)} faces (ignore sex)")
