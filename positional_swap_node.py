@@ -91,6 +91,21 @@ def _get_restorer():
     return _restorer
 
 
+def unload_models():
+    """Сброс кэша моделей (29.10). Сессии onnxruntime ComfyUI не видит и не выгружает: рядом с Qwen-Image int8 (~20 ГБ) в 24 ГБ
+    после свапа диффузии не хватало памяти и каждый кадр уходил за 100 с шлюза. На проде с Pony (6.5 ГБ) кэш полезен — не трогать."""
+    global _app, _swapper, _restorer
+    _app = _swapper = _restorer = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("[PositionalSwap] models unloaded")
+
+
 # ── restore (порт test_local_insightface_swap) ───────────────────────────────
 _FEATHER_MASK_512 = None
 
@@ -396,5 +411,21 @@ class PositionalRegionSwap:
         return (_bgr_to_img(out),)
 
 
-NODE_CLASS_MAPPINGS = {"PositionalRegionSwap": PositionalRegionSwap}
-NODE_DISPLAY_NAME_MAPPINGS = {"PositionalRegionSwap": "Positional Region Swap (matrix)"}
+class PositionalSwapUnload:
+    """Пропускает картинку дальше и выгружает модели свапа (ставить после PositionalRegionSwap перед SaveImage)."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"trigger": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "PositionalSwap"
+
+    def execute(self, trigger):
+        unload_models()
+        return (trigger,)
+
+
+NODE_CLASS_MAPPINGS = {"PositionalRegionSwap": PositionalRegionSwap, "PositionalSwapUnload": PositionalSwapUnload}
+NODE_DISPLAY_NAME_MAPPINGS = {"PositionalRegionSwap": "Positional Region Swap (matrix)",
+                              "PositionalSwapUnload": "Positional Swap: unload models"}
